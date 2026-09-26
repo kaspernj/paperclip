@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import {
+  claimedAdapterType,
+  conversationRecoveryActionPredicate,
+  gatewayRunNeverDispatched,
+  getConversationOwnershipBlocker,
+  hasVerifiedGatewayRemoteTerminal,
+} from "./conversation-continuation.js";
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
@@ -192,6 +198,64 @@ export async function markExecutionReconciliation(
         eq(issueRecoveryActions.id, action.id),
       ),
     );
+  // A verified provider stop is the operator's authoritative remote-terminal
+  // observation. The adapter cannot record it (the run is already terminal),
+  // so persist it on the run row: without this, a gateway stop the adapter
+  // could not verify would stay blocked by remote_state_unverified forever
+  // and the reconciliation would be a dead end.
+  const [sourceRun] = await db
+    .select()
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.companyId, action.companyId),
+        eq(heartbeatRuns.id, decision.runId),
+      ),
+    );
+  if (
+    sourceRun &&
+    claimedAdapterType(sourceRun) === "hermes_gateway" &&
+    ["failed", "timed_out", "interrupted", "cancelled"].includes(sourceRun.status) &&
+    !hasVerifiedGatewayRemoteTerminal(sourceRun) &&
+    !gatewayRunNeverDispatched(sourceRun)
+  ) {
+    const observedAt = new Date().toISOString();
+    const cancellation = sourceRun.resultJson?.executionCancellation as
+      Record<string, unknown> | undefined;
+    // Only upgrade a stop the adapter actually dispatched for a known remote
+    // run; a create-in-flight stop (no remote run id) keeps its requested
+    // state and is released by the terminal evidence alone.
+    const acknowledgementUpgrade =
+      cancellation?.state === "requested" && typeof cancellation.remoteRunId === "string"
+        ? {
+            executionCancellation: {
+              ...cancellation,
+              state: "acknowledged",
+              remoteStatus: "cancelled",
+              proof: "remote_terminal_status",
+              acknowledgedAt: observedAt,
+            },
+          }
+        : {};
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+          hermesRemoteTerminal: {
+            status: "cancelled",
+            source: "stop_verification",
+            observedAt,
+          },
+          ...acknowledgementUpgrade,
+        })}::jsonb`,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, action.companyId),
+          eq(heartbeatRuns.id, decision.runId),
+        ),
+      );
+  }
 }
 
 export async function deliverReconciledExecutions(

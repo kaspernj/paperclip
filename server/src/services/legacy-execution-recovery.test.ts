@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
 
 const stopped = {
@@ -71,3 +71,40 @@ it("retries a busy AI subscription only when no provider work started", () => {
    expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {} })).toBe(true);
    expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: true } } })).toBe(true);
  });
+
+describe("gateway remote stop evidence", () => {
+  const gateway = (resultJson: Record<string, unknown>) => ({
+    runtimeMode: "legacy", status: "cancelled", errorCode: "hermes_gateway_cancelled", resultJson,
+  });
+
+  it("releases the hold once the remote terminal is verified", () => {
+    expect(legacyExecutionNeedsReconciliation(gateway({
+      executionCancellation: { state: "acknowledged", remoteRunId: "run-verified", remoteStatus: "cancelled" },
+      hermesRemoteTerminal: { status: "cancelled", source: "stop_verification", observedAt: "2026-09-25T15:03:41Z" },
+    }))).toBe(false);
+    expect(legacyExecutionNeedsReconciliation(gateway({
+      hermesRemoteTerminal: { status: "cancelled", source: "event" },
+    }))).toBe(false);
+  });
+
+  it("retains the hold while the remote state is unverified", () => {
+    expect(legacyExecutionNeedsReconciliation(gateway({
+      executionCancellation: { state: "requested", remoteRunId: "run-unverified" },
+    }))).toBe(true);
+    expect(legacyExecutionNeedsReconciliation(gateway({}))).toBe(true);
+  });
+
+  it("keeps unverified timeout runs held and releases verified ones through the policy", () => {
+    expect(legacyExecutionNeedsReconciliation({
+      runtimeMode: "legacy", status: "timed_out", errorCode: "hermes_gateway_timeout",
+      resultJson: { executionCancellation: { state: "requested", remoteRunId: "run-timeout" } },
+    })).toBe(true);
+    expect(legacyExecutionNeedsReconciliation({
+      runtimeMode: "legacy", status: "timed_out", errorCode: "hermes_gateway_timeout",
+      resultJson: {
+        hermesRemoteTerminal: { status: "cancelled", source: "stop_verification" },
+        conversationContinuation: "continue_conversation_v1",
+      },
+    })).toBe(false);
+  });
+});

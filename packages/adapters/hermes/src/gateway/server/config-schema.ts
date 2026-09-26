@@ -1,5 +1,5 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
-import { DEFAULT_EVENT_RECONNECT_MS, DEFAULT_TIMEOUT_SEC } from "../shared/constants.js";
+import { DEFAULT_EVENT_RECONNECT_MS, DEFAULT_STOP_ACK_SEC, DEFAULT_TIMEOUT_SEC } from "../shared/constants.js";
 import { INSECURE_REMOTE_HTTP_ESCAPE_HATCH } from "./transport-security.js";
 
 export function getConfigSchema(): AdapterConfigSchema {
@@ -45,6 +45,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Timeout seconds",
         type: "number",
         default: DEFAULT_TIMEOUT_SEC,
+      },
+      {
+        key: "stopAckSec",
+        label: "Stop acknowledgement seconds",
+        type: "number",
+        default: DEFAULT_STOP_ACK_SEC,
+        hint: "How long to wait for the Hermes gateway to confirm a remote stop reached a terminal status. Must stay below Paperclip's 60-second stop wait.",
       },
       {
         key: "eventReconnectMs",
