@@ -10,7 +10,7 @@ import { connectionIntentService } from "./connection-intents.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
-import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
+import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, conversationContinuationEligibleForOutcome, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import {
   legacyExecutionNeedsReconciliation,
@@ -17829,11 +17829,12 @@ export function heartbeatService(
       options?.resultJson ?? null,
       stopMetadata,
     );
-    const cancellationAcknowledged =
-      parseObject(result?.executionCancellation).state === "acknowledged";
-    return options?.conversationContinuationEligible !== false && outcome !== "succeeded" &&
-      (outcome !== "cancelled" || cancellationAcknowledged) &&
-      isConversationAdapter(agent.adapterType)
+    return conversationContinuationEligibleForOutcome({
+      adapterType: agent.adapterType,
+      outcome,
+      result,
+      conversationContinuationEligible: options?.conversationContinuationEligible,
+    })
       ? { ...result, conversationContinuation: CONVERSATION_CONTINUATION_POLICY }
       : result;
   }

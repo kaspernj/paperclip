@@ -42,6 +42,12 @@ Core fields:
 - agentDefaultsPayload.apiKey (string, required unless the adapter package documents another auth field): Hermes API server key matching API_SERVER_KEY. This is the Hermes gateway key, not the claimed Paperclip API key.
 - agentDefaultsPayload.paperclipApiUrl (string, strongly recommended): Paperclip base URL as reachable from Hermes for invite, claim, skill bootstrap, and later Paperclip API calls.
 - agentDefaultsPayload.timeoutSec or timeoutMs (number, optional): Runtime request timeout when supported by the installed Hermes gateway adapter.
+- agentDefaultsPayload.stopAckSec (number, optional, default 30): How long Paperclip waits for the Hermes gateway to confirm a remote stop reached a terminal status. Clamped to 1-55 because it must stay below Paperclip's 60-second stop wait.
+
+Stop and recovery:
+- An operator Stop dispatches POST /v1/runs/<run_id>/stop to the exact remote Hermes run immediately and waits for an authoritative terminal acknowledgement within stopAckSec.
+- A verified stop records executionCancellation.state "acknowledged" with the remote run id plus hermesRemoteTerminal evidence; the conversation can then continue with a fresh explicit message (exactly one successor, history preserved).
+- An unverified stop (gateway unreachable, stop failed, or acknowledgement timeout) fails closed: the run keeps error code hermes_gateway_stop_unverified with executionCancellation.state "requested", and the task stays blocked until an operator verifies the terminal state via authenticated GET /v1/runs/<run_id> and reconciles it through the task's recovery action. Paperclip never manufactures a successful cancellation.
 
 Network examples:
 - Local loopback on one host: agentDefaultsPayload.apiBaseUrl = "http://127.0.0.1:8642"; agentDefaultsPayload.paperclipApiUrl = "http://127.0.0.1:3100".

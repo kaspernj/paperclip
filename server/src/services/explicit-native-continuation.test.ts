@@ -17,6 +17,8 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
+import { getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import { markExecutionReconciliation, settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -1013,5 +1015,135 @@ const support = await getEmbeddedPostgresTestSupport();
       status: "resolved", outcome: "blocked", nextAction: "Could not start", evidence: { runId: rejectedRunId, automaticRecovery: { replay: "blocked" } } });
     expect(await admit(f)).toMatchObject({ previousRunId: f.sourceRunId });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  describe("hermes gateway conversation turns", () => {
+    const gatewayFixture = async (resultJson: Record<string, unknown>, runOverrides: Record<string, unknown> = {}) => {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+      const sourceRunId = randomUUID(), commentId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Gateway", defaultResponsibleUserId: "board", issuePrefix: `G${companyId.slice(0, 6)}` });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Hermes", role: "engineer",
+        adapterType: "hermes_gateway", status: "idle" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Deploy", status: "blocked", assigneeAgentId: agentId });
+      await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId,
+        nativeIssueId: issueId, runtimeMode: "legacy", status: "cancelled",
+        startedAt: new Date("2026-09-25T14:50:00Z"), finishedAt: new Date("2026-09-25T15:00:00Z"),
+        runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway" } },
+        resultJson, contextSnapshot: { issueId }, ...runOverrides });
+      await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+        kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation",
+        fingerprint: `legacy-execution:${sourceRunId}`, status: "active",
+        nextAction: "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing.",
+        evidence: { runId: sourceRunId, adapterRecovery: "unsupported_or_unknown" } });
+      await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorType: "user",
+        authorUserId: "board", body: "Continue with the next step.", createdAt: new Date("2026-09-25T16:00:00Z") });
+      return { companyId, issueId, agentId, sourceRunId, commentId, successorRunId: randomUUID(),
+        actorType: "user", actorId: "board", reason: "issue_commented" };
+    };
+    const admitGateway = (f: Awaited<ReturnType<typeof gatewayFixture>>, dryRun = false) => db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issueId)).for("update");
+      const result = await admitExplicitNativeContinuation({ ...f, dryRun, db: tx as unknown as typeof db });
+      if (result && !dryRun) await tx.insert(heartbeatRuns).values({ id: f.successorRunId, companyId: f.companyId,
+        agentId: f.agentId, status: "queued", contextSnapshot: { issueId: f.issueId, previousRunId: result.previousRunId, forceFreshSession: true } });
+      return result;
+    });
+
+    it("releases a verified gateway stop: no blocker, hold folds without replay", async () => {
+      const f = await gatewayFixture({
+        conversationContinuation: "continue_conversation_v1",
+        executionCancellation: { state: "acknowledged", remoteRunId: "run-verified", remoteStatus: "cancelled", acknowledgedAt: "2026-09-25T15:00:05Z" },
+        hermesRemoteTerminal: { status: "cancelled", source: "stop_verification", observedAt: "2026-09-25T15:00:05Z" },
+      });
+      // The verified remote terminal releases the ownership blocker, so a
+      // fresh message is not held and needs no admission.
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      // The periodic settle retires the hold without replay.
+      await settleUnrecoverableExecutions(db);
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(action).toMatchObject({ status: "resolved", outcome: "cancelled" });
+      expect(action.nextAction).toMatch(/new message/);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    });
+
+    it("blocks a fresh message while the gateway remote state is unverified", async () => {
+      const f = await gatewayFixture({
+        executionCancellation: { state: "requested", remoteRunId: "run-unverified" },
+      });
+      expect(await admitGateway(f)).toBeNull();
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({
+        cause: "remote_state_unverified", recoveryActionId: null,
+      });
+    });
+
+    it("blocks a legacy gateway row that recorded no stop evidence", async () => {
+      const f = await gatewayFixture({});
+      expect(await admitGateway(f)).toBeNull();
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({
+        cause: "remote_state_unverified", recoveryActionId: null,
+      });
+    });
+
+    it("records verified remote evidence on the run row when the operator reconciles the unverified stop", async () => {
+      const f = await gatewayFixture({
+        executionCancellation: { state: "requested", remoteRunId: "run-reconciled", requestedAt: "2026-09-25T14:50:34Z", reason: "ack_timeout" },
+      });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({
+        cause: "remote_state_unverified", recoveryActionId: null,
+      });
+      // The resolve route persists the operator's verified remote evidence
+      // here; without the run-row write the blocker would never clear.
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      await markExecutionReconciliation(db, action, {
+        runId: f.sourceRunId, providerStopped: true, actionOutcome: "mixed",
+        outcomeEvidence: "Authenticated GET /v1/runs/run-reconciled returned status 'cancelled' at 2026-09-25T15:05:00Z (operator-verified)",
+      }, "board");
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      expect(run.resultJson).toMatchObject({
+        hermesRemoteTerminal: { status: "cancelled", source: "stop_verification" },
+        executionCancellation: { state: "acknowledged", remoteRunId: "run-reconciled", remoteStatus: "cancelled" },
+      });
+      // The woken successor passes the stale gate: no ownership blocker.
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      // The hold is now retirable and folds without replay.
+      await settleUnrecoverableExecutions(db);
+      const [settled] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(settled).toMatchObject({ status: "resolved", outcome: "cancelled" });
+      expect(settled.nextAction).toMatch(/new message/);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    });
+
+    it("admits a successor for a timed-out gateway run after the operator reconciles it", async () => {
+      const f = await gatewayFixture({
+        executionCancellation: { state: "requested", remoteRunId: "run-timeout", requestedAt: "2026-09-25T14:50:34Z", reason: "ack_timeout" },
+      }, { status: "timed_out", errorCode: "hermes_gateway_stop_unverified" });
+      expect(await admitGateway(f)).toBeNull();
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({
+        cause: "remote_state_unverified", recoveryActionId: null,
+      });
+      const [action] = await db.select().from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      await markExecutionReconciliation(db, action, {
+        runId: f.sourceRunId, providerStopped: true, actionOutcome: "mixed",
+        outcomeEvidence: "Authenticated GET /v1/runs/run-timeout returned status 'cancelled' at 2026-09-25T15:05:00Z (operator-verified)",
+      }, "board");
+      // The operator's verified stop clears the execution ownership gate.
+      // The action hold itself is retired by the resolve route in production
+      // (same transaction); admission retires it here.
+      expect(await getConversationOwnershipBlocker(db, f.companyId, f.issueId)).toBeNull();
+      // The verified remote terminal releases the admission stop-proof.
+      expect(await admitGateway(f)).toMatchObject({ previousRunId: f.sourceRunId });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    });
+
+    it("admits a gateway run that never dispatched provider work", async () => {
+      const f = await gatewayFixture({
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      }, { status: "failed", errorCode: "hermes_gateway_auth_failed" });
+      expect(await admitGateway(f)).toMatchObject({ previousRunId: f.sourceRunId });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    });
   });
 });

@@ -136,6 +136,64 @@ After Hermes submits the join request:
 Once the key is claimed, create an issue assigned to the new Hermes gateway
 agent and wake it through the normal Paperclip heartbeat path.
 
+## Stop And Recovery
+
+Stopping a `hermes_gateway` run is remote, so Paperclip treats it differently
+from local adapters:
+
+- An operator Stop dispatches a remote `POST /v1/runs/<run_id>/stop` to the
+  exact Hermes run immediately, then waits up to `stopAckSec` (adapter config,
+  default 30, clamped to 1-55) for an authoritative terminal acknowledgement.
+  The window must stay below Paperclip's 60-second stop wait.
+- A verified stop records `executionCancellation.state: "acknowledged"` with
+  the remote run id, plus `hermesRemoteTerminal` evidence, in the run's
+  result. The run is terminal and the conversation can continue.
+- If the terminal state is not confirmed within the window (gateway
+  unreachable, stop request failed, or acknowledgement timed out), the run
+  stays blocked with error code `hermes_gateway_stop_unverified` and
+  `executionCancellation.state: "requested"`. Paperclip never manufactures a
+  successful cancellation; the unknown remote state fails closed.
+- A stop that arrives before the remote run is created records bootstrap
+  evidence (`providerWorkStarted: false`) and no provider work starts. A stop
+  that races an in-flight remote create leaves the remote state unknown
+  (the idempotency key is the Paperclip run id); verify the gateway before
+  continuing.
+
+To recover an unverified stop, an operator confirms the terminal state at the
+gateway with an authenticated `GET /v1/runs/<run_id>` (terminal statuses are
+`completed`, `failed`, `cancelled`, `interrupted`, and their aliases), then
+records the outcome through the task's recovery action:
+
+```sh
+curl -sS -X POST "$PAPERCLIP_API_URL/api/issues/<issue-id>/recovery-actions/resolve" \
+  -H "Authorization: Bearer $PAPERCLIP_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "actionId": "<recovery-action-id>",
+    "outcome": "restored",
+    "sourceIssueStatus": "todo",
+    "executionReconciliation": {
+      "runId": "<paperclip-run-id>",
+      "providerStopped": true,
+      "actionOutcome": "mixed",
+      "outcomeEvidence": "Authenticated GET /v1/runs/<remote-run-id> returned status cancelled at <timestamp> (operator-verified)"
+    }
+  }'
+```
+
+Use `npx paperclipai issue recovery:resolve <issue-id> --action-id <id>
+--outcome restored --source-issue-status todo` for a basic resolve; the CLI
+does not accept an `executionReconciliation` payload, so use the API call
+above when recording verified remote evidence. Find the active recovery
+action id with `npx paperclipai issue recovery-actions <issue-id>`.
+
+After a verified terminal gateway run, a fresh explicit message on the task
+continues the conversation with history preserved and creates exactly one
+successor run. Paperclip does not replay the whole task automatically, and
+queued messages are not discarded. Until the remote state is verified,
+`hermes_gateway` runs keep the task blocked with an actionable explanation
+instead of guessing.
+
 ## Local Fresh-State Smoke
 
 For a fresh Docker-backed Hermes gateway and end-to-end Paperclip join/run

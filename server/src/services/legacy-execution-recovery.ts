@@ -1,5 +1,5 @@
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
-import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
+import { claimedAdapterType, hasConversationContinuationPolicy, hasVerifiedGatewayRemoteTerminal } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
@@ -31,6 +31,10 @@ export function legacyExecutionNeedsReconciliation(
       && evidence.providerStopped === true && evidence.sessionPreserved === true
       && evidence.actionOutcomes === "settled"
       && (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged") return false;
+  // A gateway stop releases the hold only once the remote terminal is
+  // verified; an unverified (requested) stop keeps it until the remote state
+  // is reconciled.
+  if (run.status === "cancelled" && hasVerifiedGatewayRemoteTerminal(run)) return false;
   // Waiting for a subscription or workspace precedes provider execution. It is
   // a resource wait, not a failed provider attempt or permission to replay work.
   if (run.status === "cancelled" && run.errorCode === "ai_connection_busy" &&
@@ -141,7 +145,9 @@ export async function terminalizeLegacyExecution(input: {
           attempt: executionFailureRetryCount(run) + 1,
         },
         nextAction:
-          "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
+          claimedAdapterType(run) === "hermes_gateway"
+            ? "The remote Hermes gateway run has not been verified as stopped. Verify its terminal state at the gateway (authenticated GET /v1/runs/<run id>) and reconcile its outcome before continuing."
+            : "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
         maxAttempts: 3,
         wakePolicy: null,
         supersedeOnIdentityChange: true,

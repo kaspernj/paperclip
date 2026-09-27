@@ -14,7 +14,7 @@ import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
 
-import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
+import { gatewayRunNeverDispatched, hasVerifiedGatewayRemoteTerminal, historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -210,12 +210,21 @@ export async function admitExplicitNativeContinuation(input: {
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       if (!unusedAdmission && !cancelledStartup) {
-        // A missing process identity is not evidence that a provider exited.
-        if (!run.processPid && !run.processGroupId &&
-            !await hasNativeLocalProcessStop(db, companyId, run.id) &&
-            !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
-        if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
-        if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+        const historical = await historicalAdapterType(db, run);
+        if (historical === "hermes_gateway") {
+          // The executor is remote; the local process table cannot prove it
+          // stopped. Only verified remote terminal evidence (or proof no
+          // remote run was created) releases the turn.
+          if (!gatewayRunNeverDispatched(run) && !hasVerifiedGatewayRemoteTerminal(run)) return blocked("remote_state_unverified",
+            "The remote Hermes run has not been verified as stopped. Verify its terminal state at the gateway and record the outcome through the task's recovery action before continuing. Your message is saved.");
+        } else {
+          // A missing process identity is not evidence that a provider exited.
+          if (!run.processPid && !run.processGroupId &&
+              !await hasNativeLocalProcessStop(db, companyId, run.id) &&
+              !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
+          if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+          if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+        }
       }
     }
     sources.push(run);
